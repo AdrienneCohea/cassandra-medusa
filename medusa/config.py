@@ -65,8 +65,9 @@ MedusaConfig = collections.namedtuple(
     'MedusaConfig',
     [
         'file_path',  # Store a specific config file path, None for default file
-        'storage', 'cassandra', 'ssh', 'checks', 'monitoring', 'logging', 'grpc', 'kubernetes'
-    ]
+        'storage', 'cassandra', 'ssh', 'checks', 'monitoring', 'logging', 'grpc', 'kubernetes', 'ssm'
+    ],
+    defaults=(None,)
 )
 
 LoggingConfig = collections.namedtuple(
@@ -84,6 +85,15 @@ KubernetesConfig = collections.namedtuple(
     ['enabled', 'cassandra_url', 'use_mgmt_api', 'ca_cert', 'tls_cert', 'tls_key']
 )
 
+SSMConfig = collections.namedtuple(
+    'SSMConfig',
+    [
+        'enabled', 'region', 'document_name', 'execution_timeout', 'delivery_timeout',
+        'poll_interval_min', 'poll_interval_max', 'run_as_user', 'login_shell',
+        'host_instance_map', 'output_s3_bucket', 'output_s3_prefix'
+    ]
+)
+
 CONFIG_SECTIONS = {
     'storage': StorageConfig,
     'cassandra': CassandraConfig,
@@ -92,7 +102,8 @@ CONFIG_SECTIONS = {
     'monitoring': MonitoringConfig,
     'logging': LoggingConfig,
     'grpc': GrpcConfig,
-    'kubernetes': KubernetesConfig
+    'kubernetes': KubernetesConfig,
+    'ssm': SSMConfig
 }
 
 DEFAULT_CONFIGURATION_PATH = pathlib.Path('/etc/medusa/medusa.ini')
@@ -189,6 +200,21 @@ def _build_default_config():
         'tls_cert': '',
         'tls_key': ''
     }
+
+    config['ssm'] = {
+        'enabled': 'False',
+        'region': '',
+        'document_name': 'AWS-RunShellScript',
+        'execution_timeout': '86400',
+        'delivery_timeout': '600',
+        'poll_interval_min': '2',
+        'poll_interval_max': '30',
+        'run_as_user': '',
+        'login_shell': 'False',
+        'host_instance_map': '',
+        'output_s3_bucket': '',
+        'output_s3_prefix': '',
+    }
     return config
 
 
@@ -204,6 +230,7 @@ def parse_config(args, config_file):
     _load_config_file(config, config_file)
     _override_config_with_args(config, args)
     _handle_k8s_and_grpc_settings(config, args)
+    _handle_ssm_settings(config, args)
     _handle_env_vars(config)
     _handle_k8s_secrets(config)
     _handle_hostname_resolution(config)
@@ -254,6 +281,13 @@ def _handle_k8s_and_grpc_settings(config, args):
         config['storage']['use_sudo_for_restore'] = 'False'
         if "POD_IP" in os.environ:
             config['storage']['fqdn'] = os.environ["POD_IP"]
+
+
+def _handle_ssm_settings(config, args):
+    """Apply CLI --ssm-enabled override without colliding with other sections' 'enabled' fields."""
+    ssm_enabled_arg = args.get('ssm_enabled')
+    if ssm_enabled_arg is not None:
+        config.set('ssm', 'enabled', 'True' if evaluate_boolean(ssm_enabled_arg) else 'False')
 
 
 def _handle_env_vars(config):
@@ -356,7 +390,8 @@ def load_config(args, config_file):
         monitoring=_namedtuple_from_dict(MonitoringConfig, config['monitoring']),
         logging=_namedtuple_from_dict(LoggingConfig, config['logging']),
         grpc=_namedtuple_from_dict(GrpcConfig, config['grpc']),
-        kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes'])
+        kubernetes=_namedtuple_from_dict(KubernetesConfig, config['kubernetes']),
+        ssm=_namedtuple_from_dict(SSMConfig, config['ssm'])
     )
 
     for field in ['bucket_name', 'storage_provider']:
@@ -369,10 +404,14 @@ def load_config(args, config_file):
             logging.error('Required configuration "{}" is missing in [cassandra] section.'.format(field))
             sys.exit(2)
 
-    for field in ['username', 'key_file']:
-        if getattr(medusa_config.ssh, field) is None:
-            logging.error('Required configuration "{}" is missing in [ssh] section.'.format(field))
-            sys.exit(2)
+    ssm_enabled = evaluate_boolean(medusa_config.ssm.enabled) if medusa_config.ssm else False
+    if not ssm_enabled:
+        for field in ['username', 'key_file']:
+            if getattr(medusa_config.ssh, field) is None:
+                logging.error('Required configuration "{}" is missing in [ssh] section.'.format(field))
+                sys.exit(2)
+    else:
+        _validate_ssm_config(medusa_config.ssm)
 
     for field in ['bucket_name', 'prefix']:
         value = getattr(medusa_config.storage, field)
@@ -381,6 +420,34 @@ def load_config(args, config_file):
             sys.exit(2)
 
     return medusa_config
+
+
+def _validate_ssm_config(ssm_config):
+    """Validate SSM timeout and polling bounds when SSM orchestration is enabled."""
+    try:
+        exec_timeout = int(ssm_config.execution_timeout)
+        delivery_timeout = int(ssm_config.delivery_timeout)
+    except (TypeError, ValueError):
+        logging.error('SSM execution_timeout and delivery_timeout must be integers.')
+        sys.exit(2)
+
+    if not (30 <= exec_timeout <= 172800):
+        logging.error('SSM execution_timeout must be between 30 and 172800 seconds.')
+        sys.exit(2)
+    if not (30 <= delivery_timeout <= 3600):
+        logging.error('SSM delivery_timeout must be between 30 and 3600 seconds.')
+        sys.exit(2)
+
+    try:
+        poll_min = float(ssm_config.poll_interval_min)
+        poll_max = float(ssm_config.poll_interval_max)
+    except (TypeError, ValueError):
+        logging.error('SSM poll_interval_min and poll_interval_max must be numbers.')
+        sys.exit(2)
+
+    if poll_min <= 0 or poll_max <= 0 or poll_min > poll_max:
+        logging.error('SSM poll_interval_min must be > 0 and <= poll_interval_max.')
+        sys.exit(2)
 
 
 def _zip_fields_with_arg_values(fields, args):
