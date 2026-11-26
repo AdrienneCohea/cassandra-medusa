@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from abc import ABC, abstractmethod
 import asyncio
+from dataclasses import dataclass
 import logging
 
 import asyncssh
@@ -23,7 +25,7 @@ from medusa.storage import divide_chunks
 
 
 def display_output(host_results):
-    """Log stdout/stderr for a list of (host, SSHCompletedProcess) pairs."""
+    """Log stdout/stderr for a list of (host, CommandResult | SSHCompletedProcess) pairs."""
     for host, result in host_results:
         if isinstance(result, BaseException):
             logging.info("{}-error: {}".format(host, result))
@@ -37,6 +39,14 @@ def display_output(host_results):
 class OrchestrationError(RuntimeError):
     """Raised when an unexpected error occurs during orchestration of commands across nodes."""
     pass
+
+
+@dataclass
+class CommandResult:
+    """Normalized command execution result compatible with display_output()."""
+    returncode: int
+    stdout: str = ''
+    stderr: str = ''
 
 
 async def _run_one(host, command, connect_kwargs):
@@ -57,10 +67,45 @@ async def _run_on_hosts(hosts, commands, connect_kwargs):
     return list(zip(hosts, results))
 
 
-class Orchestration(object):
+class BaseOrchestration(ABC):
+    """Base class for cluster command orchestration backends."""
+
     def __init__(self, config, pool_size=10):
         self.pool_size = pool_size
         self.config = config
+
+    @abstractmethod
+    def pssh_run(self, hosts, command, hosts_variables=None, ssh_client=None):
+        """Execute a command across target hosts. Returns True on full success, False on any error."""
+
+    @staticmethod
+    def _substitute_commands(hosts, command, hosts_variables=None):
+        """Return per-host commands with %s placeholders substituted when hosts_variables is a list."""
+        # `{}` (empty dict, backup path) and None both mean no substitution.
+        if hosts_variables and isinstance(hosts_variables, list):
+            return [command % tuple(hosts_variables[idx]) for idx in range(len(hosts))]
+        return [command] * len(hosts)
+
+    @staticmethod
+    def _report_results(command, hosts, success, error, backend_name='SSH'):
+        """Log execution outcomes and return True if all hosts succeeded, False otherwise."""
+        if len(success) == len(hosts):
+            logging.info('Job executing "{}" ran and finished Successfully on all nodes.'
+                         .format(command))
+            return True
+        elif len(error) > 0:
+            logging.error('Job executing "{}" ran and finished with errors on following nodes: {}'
+                          .format(command, sorted({host for host, _ in error})))
+            display_output(error)
+            return False
+        else:
+            err_msg = 'Something unexpected happened while running {} command'.format(backend_name)
+            logging.error(err_msg)
+            raise OrchestrationError(err_msg)
+
+
+class SshOrchestration(BaseOrchestration):
+    """Run commands on remote hosts in parallel over SSH via asyncssh."""
 
     def pssh_run(self, hosts, command, hosts_variables=None, ssh_client=None):
         """Run command on hosts in parallel via asyncssh. Returns True on full success, False on any error.
@@ -99,24 +144,18 @@ class Orchestration(object):
         if pkey is not None:
             connect_kwargs['client_keys'] = [(pkey, cert_file)] if cert_file is not None else [pkey]
 
-        pssh_run_success = False
         success = []
         error = []
-        i = 1
 
         logging.info('Executing "{command}" on following nodes {hosts} with a parallelism/pool size of {pool_size}'
                      .format(command=command, hosts=hosts, pool_size=self.pool_size))
 
-        for parallel_hosts in divide_chunks(hosts, self.pool_size):
-            # `{}` (empty dict, backup path) and None both mean no substitution.
-            if hosts_variables and isinstance(hosts_variables, list):
-                batch_start = (i - 1) * self.pool_size
-                commands = [
-                    command % tuple(hosts_variables[batch_start + j])
-                    for j in range(len(parallel_hosts))
-                ]
-            else:
-                commands = [command] * len(parallel_hosts)
+        all_commands = self._substitute_commands(hosts, command, hosts_variables)
+        host_command_pairs = list(zip(hosts, all_commands))
+
+        for i, pair_batch in enumerate(divide_chunks(host_command_pairs, self.pool_size), start=1):
+            parallel_hosts = [host for host, _ in pair_batch]
+            commands = [cmd for _, cmd in pair_batch]
 
             # sudo wraps the command; login shell wraps everything (sudo is inside the shell).
             processed_commands = [
@@ -141,20 +180,27 @@ class Orchestration(object):
                 else:
                     error.append((host, result))
 
-            i += 1
+        return self._report_results(command, hosts, success, error, backend_name='SSH')
 
-        # Report on execution status
-        if len(success) == len(hosts):
-            logging.info('Job executing "{}" ran and finished Successfully on all nodes.'
-                         .format(command))
-            pssh_run_success = True
-        elif len(error) > 0:
-            logging.error('Job executing "{}" ran and finished with errors on following nodes: {}'
-                          .format(command, sorted({host for host, _ in error})))
-            display_output(error)
-        else:
-            err_msg = 'Something unexpected happened while running SSH command'
-            logging.error(err_msg)
-            raise OrchestrationError(err_msg)
 
-        return pssh_run_success
+class Orchestration(object):
+    """Facade selecting SSH or AWS SSM orchestration based on configuration."""
+
+    def __init__(self, config, pool_size=10):
+        self.pool_size = pool_size
+        self.config = config
+        self._backend = self._create_backend(config, pool_size)
+
+    @staticmethod
+    def _create_backend(config, pool_size):
+        ssm_cfg = getattr(config, 'ssm', None)
+        if ssm_cfg is not None and medusa.utils.evaluate_boolean(ssm_cfg.enabled):
+            from medusa.ssm_orchestration import SsmOrchestration
+            return SsmOrchestration(config, pool_size=pool_size)
+        return SshOrchestration(config, pool_size=pool_size)
+
+    def pssh_run(self, hosts, command, hosts_variables=None, ssh_client=None):
+        """Run command on hosts via the configured orchestration backend."""
+        return self._backend.pssh_run(
+            hosts, command, hosts_variables=hosts_variables, ssh_client=ssh_client
+        )

@@ -266,6 +266,67 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         mock_log_error.assert_called_with('Required configuration "prefix" cannot contain a slash ("/")')
 
+    def test_ssm_defaults(self):
+        """Ensure [ssm] defaults are populated and SSM is disabled by default."""
+        config = medusa.config.load_config({}, self.medusa_config_file)
+        assert config.ssm is not None
+        assert config.ssm.enabled == 'False'
+        assert config.ssm.region == ''
+        assert config.ssm.document_name == 'AWS-RunShellScript'
+        assert config.ssm.execution_timeout == '86400'
+        assert config.ssm.delivery_timeout == '600'
+        assert config.ssm.poll_interval_min == '2'
+        assert config.ssm.poll_interval_max == '30'
+        assert config.ssm.run_as_user == ''
+        assert config.ssm.login_shell == 'False'
+        assert config.ssm.host_instance_map == ''
+        assert config.ssm.output_s3_bucket == ''
+        assert config.ssm.output_s3_prefix == ''
+
+    def test_ssm_enabled_cli_override(self):
+        """Ensure --ssm-enabled enables SSM without colliding with grpc/kubernetes enabled."""
+        config = medusa.config.load_config({'ssm_enabled': True}, self.medusa_config_file)
+        assert medusa.utils.evaluate_boolean(config.ssm.enabled)
+        assert not medusa.utils.evaluate_boolean(config.grpc.enabled)
+        assert not medusa.utils.evaluate_boolean(config.kubernetes.enabled)
+
+        config_default = medusa.config.load_config({'ssm_enabled': None}, self.medusa_config_file)
+        assert not medusa.utils.evaluate_boolean(config_default.ssm.enabled)
+
+    def test_ssm_enabled_skips_ssh_validation(self):
+        """When SSM is enabled, missing [ssh] username/key_file does not trigger SystemExit."""
+        ini_content = (
+            "[cassandra]\nstart_cmd = start\nstop_cmd = stop\n"
+            "[storage]\nbucket_name = bkt\nstorage_provider = s3_us_west_oregon\n"
+            "[ssm]\nenabled = True\n"
+        )
+        with tempfile.NamedTemporaryFile('w', suffix='.ini', delete=False) as tmp:
+            tmp.write(ini_content)
+            tmp_path = pathlib.Path(tmp.name)
+        try:
+            with patch.dict(os.environ, {'USER': ''}):
+                config = medusa.config.load_config({'username': None, 'key_file': None}, tmp_path)
+            assert medusa.utils.evaluate_boolean(config.ssm.enabled)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    @patch('medusa.config.logging.error')
+    def test_ssm_invalid_timeouts_rejected(self, mock_log_error):
+        """Invalid SSM timeout or polling bounds cause SystemExit(2) when SSM is enabled."""
+        for bad_args in (
+            {'ssm_enabled': True, 'execution_timeout': '10'},
+            {'ssm_enabled': True, 'execution_timeout': '200000'},
+            {'ssm_enabled': True, 'execution_timeout': 'not-an-int'},
+            {'ssm_enabled': True, 'delivery_timeout': '5'},
+            {'ssm_enabled': True, 'delivery_timeout': '5000'},
+            {'ssm_enabled': True, 'poll_interval_min': '20', 'poll_interval_max': '10'},
+            {'ssm_enabled': True, 'poll_interval_min': '0'},
+        ):
+            with self.assertRaises(SystemExit) as cm:
+                medusa.config.load_config(bad_args, self.medusa_config_file)
+            self.assertEqual(cm.exception.code, 2)
+        assert mock_log_error.called
+
 
 if __name__ == '__main__':
     unittest.main()

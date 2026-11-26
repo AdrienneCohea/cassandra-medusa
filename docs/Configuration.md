@@ -166,6 +166,30 @@ backup_grace_period_in_days = 10
 ; directly or in CI — enabling it with no agent causes asyncssh to hang indefinitely.
 ;forward_agent = False
 
+[ssm]
+; Use AWS Systems Manager (SSM) instead of SSH for cluster orchestration (can also be enabled via --ssm-enabled).
+;enabled = False
+; Optional AWS region override for SSM/EC2 clients (defaults to boto3 credential/region chain).
+;region =
+; SSM document used to run shell commands on target instances.
+;document_name = AWS-RunShellScript
+; Maximum execution time (seconds) per command on each node (30-172800). Defaults to 24h.
+;execution_timeout = 86400
+; Delivery timeout (seconds) for SSM to reach an instance (30-3600).
+;delivery_timeout = 600
+; Polling interval bounds (seconds) with exponential backoff.
+;poll_interval_min = 2
+;poll_interval_max = 30
+; Optional OS user to run commands as (empty runs as SSM default root; cassandra.use_sudo is only applied when set).
+;run_as_user =
+; Wrap remote commands in a login shell.
+;login_shell = False
+; Optional path to a static host-to-instance-id mapping file (lines formatted as "host,i-..." or "host=i-...").
+;host_instance_map =
+; Optional S3 bucket/prefix for full command stdout/stderr exceeding SSM's 24KB inline output limit.
+;output_s3_bucket =
+;output_s3_prefix =
+
 [checks]
 ;health_check = <Which ports to check when verifying a node restored properly. Options are 'cql' (default), 'thrift', 'all'.>
 ;query = <CQL query to run after a restore to verify it went OK>
@@ -224,3 +248,14 @@ Some config settings can be overriden through environment variables prefixed wit
 If you are using environment variables to override some settings, you can source a file containing the environment variables before running Medusa commands. For example, if you have a file named `/etc/default/cassandra-medusa` containing exported environment variables.
 
 These variables will also be available when running Medusa cluster commands, e.g. backup-cluster.
+
+### AWS SSM Orchestration IAM Permissions
+
+When `[ssm] enabled = True` (or `--ssm-enabled` is passed on the CLI), the control node uses the standard `boto3` credential and region chain to orchestrate commands over AWS SSM instead of SSH. The control node's IAM identity requires:
+
+- `ssm:SendCommand`
+- `ssm:GetCommandInvocation`
+- `ssm:CancelCommand`
+- `ssm:DescribeInstanceInformation`
+- `ec2:DescribeInstances` (optional — used for dynamic IP/DNS-to-instance-ID resolution; falls back to `ssm:DescribeInstanceInformation` or `host_instance_map` if absent)
+- `s3:GetObject` and `s3:PutObject` (optional — only needed when `output_s3_bucket` is configured to capture output exceeding SSM's 24KB inline limit)
